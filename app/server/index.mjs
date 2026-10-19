@@ -5,7 +5,7 @@
 import { createServer } from 'node:http'
 import { createServer as createServerTls } from 'node:https'
 import { networkInterfaces } from 'node:os'
-import { createReadStream, readFileSync, statSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
+import { createReadStream, readFileSync, statSync, writeFileSync, renameSync, mkdirSync, realpathSync } from 'node:fs'
 import { join, dirname, extname, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
@@ -336,7 +336,12 @@ function ipsLocales() {
   return Object.values(networkInterfaces()).flat().filter((x) => x && x.family === 'IPv4' && !x.internal).map((x) => x.address)
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/** ¿Se corre este archivo directamente? (con realpath: /tmp en macOS es un symlink a /private/tmp) */
+function esPrincipal() {
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch { return false }
+}
+
+if (esPrincipal()) {
   const cfg = configDesdeEntorno()
   crearServidor(cfg).listen(cfg.puerto, cfg.host, () => {
     const esquema = cfg.tls ? 'https' : 'http'
