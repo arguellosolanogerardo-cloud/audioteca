@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Audioteca: un solo comando para todo. `./audioteca ayuda` para ver las órdenes.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$DIR/.venv/bin/python"
+P="$DIR/pipeline"
+
+necesita_python() {
+  if [[ ! -x "$PY" ]]; then
+    echo "Falta el entorno de Python. Corre primero: ./setup.sh" >&2
+    exit 1
+  fi
+}
+
+ayuda() {
+  cat <<'EOF'
+Audioteca · tus libros como audiolibros en español, con IA local en tu Mac
+
+  ./audioteca libro <archivo> --slug <slug> [--titulo "…"] [--autor "…"]
+        Libro en español (PDF, EPUB, TXT o MD) → biblioteca, listo para narrar. Con --ver solo muestra capítulos.
+  ./audioteca traducir <archivo> --slug <slug> [--glosario glosario.md] [--titulo "…"] [--autor "…"]
+        Libro en inglés → español con Gemma 4 12B local (control de calidad incluido). --solo-extraer para revisar.
+  ./audioteca narrar [--libro <slug>] [--voz <voz>] [--vigilar] [--plan]
+        Narra lo pendiente (todo, o un libro). --vigilar se queda esperando libros nuevos.
+  ./audioteca voz listar | base | clonar <nombre> <audio> "<transcripción>" | probar <voz> ["frase"]
+        Voces: macos (siempre), qwen-clon (genérica, `voz base`) y la tuya (`voz clonar`).
+  ./audioteca servir
+        Abre la app en tu red local: entra desde el iPhone a la URL que imprime.
+  ./audioteca estado            Libros, voces y lo que se está narrando.
+  ./audioteca demo              Agrega un fragmento del Quijote (dominio público) y lo narra con la voz de macOS.
+  ./audioteca modelos           Descarga por adelantado los modelos de IA (~1 GB voz + ~7 GB traductor).
+  ./audioteca servicio instalar | quitar | estado
+        Deja la app y el narrador corriendo solos al encender el Mac (launchd, opcional).
+  ./audioteca servidor-traduccion [--puerto 5055]
+        API local compatible con LibreTranslate (EN→ES) para usar el traductor desde otras apps.
+  ./audioteca check             Corre todas las pruebas.
+
+Configuración: .env (copia de .env.example). Formato de los libros: docs/FORMATO.md.
+EOF
+}
+
+etiqueta_servidor="com.audioteca.servidor"
+etiqueta_narrador="com.audioteca.narrador"
+agentes="$HOME/Library/LaunchAgents"
+
+plist() { # etiqueta, log, programa args…
+  local etiqueta="$1" log="$2"; shift 2
+  echo '<?xml version="1.0" encoding="UTF-8"?>'
+  echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+  echo '<plist version="1.0"><dict>'
+  echo "  <key>Label</key><string>$etiqueta</string>"
+  echo '  <key>ProgramArguments</key><array>'
+  for a in "$@"; do echo "    <string>$a</string>"; done
+  echo '  </array>'
+  echo "  <key>WorkingDirectory</key><string>$DIR</string>"
+  echo '  <key>EnvironmentVariables</key><dict>'
+  echo "    <key>PATH</key><string>$(dirname "$(command -v node || echo /opt/homebrew/bin/node)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"
+  echo '    <key>PYTHONUNBUFFERED</key><string>1</string>'
+  echo '  </dict>'
+  echo '  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>'
+  echo '  <key>Nice</key><integer>5</integer>'
+  echo "  <key>StandardOutPath</key><string>$log</string><key>StandardErrorPath</key><string>$log</string>"
+  echo '</dict></plist>'
+}
+
+servicio() {
+  local logs="$DIR/.trabajo/logs"
+  case "${1:-estado}" in
+    instalar)
+      necesita_python
+      mkdir -p "$agentes" "$logs"
+      plist "$etiqueta_servidor" "$logs/servidor.log" "$(command -v node)" "$DIR/app/server/index.mjs" > "$agentes/$etiqueta_servidor.plist"
+      plist "$etiqueta_narrador" "$logs/narrador.log" "$PY" -u "$P/narrar.py" --vigilar > "$agentes/$etiqueta_narrador.plist"
+      for e in "$etiqueta_servidor" "$etiqueta_narrador"; do
+        launchctl bootout "gui/$(id -u)/$e" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$agentes/$e.plist"
+      done
+      echo "Listo: la app y el narrador arrancan solos al iniciar sesión. Logs en $logs/"
+      ;;
+    quitar)
+      for e in "$etiqueta_servidor" "$etiqueta_narrador"; do
+        launchctl bootout "gui/$(id -u)/$e" 2>/dev/null || true
+        [[ -f "$agentes/$e.plist" ]] && mv "$agentes/$e.plist" "$logs/$e.plist.quitado" 2>/dev/null || true
+      done
+      echo "Servicios detenidos (los plist quedaron en $logs/ por si los quieres revisar)."
+      ;;
+    imprimir)  # para revisar lo que se instalaría, sin instalar nada
+      plist "$etiqueta_servidor" "$logs/servidor.log" "$(command -v node)" "$DIR/app/server/index.mjs"
+      plist "$etiqueta_narrador" "$logs/narrador.log" "$PY" -u "$P/narrar.py" --vigilar
+      ;;
+    estado)
+      for e in "$etiqueta_servidor" "$etiqueta_narrador"; do
+        if launchctl print "gui/$(id -u)/$e" >/dev/null 2>&1; then echo "$e: activo"; else echo "$e: no instalado"; fi
+      done
+      ;;
+    *) echo "uso: ./audioteca servicio instalar | quitar | estado | imprimir" >&2; exit 2 ;;
+  esac
+}
+
+orden="${1:-ayuda}"
+[[ $# -gt 0 ]] && shift
+case "$orden" in
+  libro|extraer)  necesita_python; exec "$PY" "$P/extraer.py" "$@" ;;
+  traducir)       necesita_python; exec "$PY" "$P/traducir.py" "$@" ;;
+  narrar)         necesita_python; exec "$PY" -u "$P/narrar.py" "$@" ;;
+  voz|voces)      necesita_python; exec "$PY" "$P/voces.py" "$@" ;;
+  estado)         necesita_python; "$PY" "$P/biblioteca.py"; exec "$PY" "$P/narrar.py" --plan ;;
+  servir|app)     exec node "$DIR/app/server/index.mjs" "$@" ;;
+  servidor-traduccion) necesita_python; exec "$PY" "$P/servidor_traduccion.py" "$@" ;;
+  demo)
+    necesita_python
+    "$PY" "$P/extraer.py" "$DIR/tests/fixtures/quijote.md" --slug quijote-demo --titulo "Don Quijote (fragmento)" \
+      --autor "Miguel de Cervantes" --voz macos
+    "$PY" -u "$P/narrar.py" --libro quijote-demo --voz macos
+    echo
+    echo "Listo. Abre la app con:  ./audioteca servir"
+    ;;
+  modelos)
+    necesita_python
+    cd "$DIR"
+    "$PY" - <<'EOF'
+import sys
+sys.path.insert(0, "pipeline")
+import config, motores
+from huggingface_hub import snapshot_download
+for repo in (config.MODELO_TTS, motores.CATALOGO[config.MOTOR_TRADUCCION][1]):
+    print(f"descargando {repo}…", flush=True)
+    print("  →", snapshot_download(repo))
+EOF
+    ;;
+  servicio)       servicio "$@" ;;
+  check|pruebas)  cd "$DIR" && exec npm run check ;;
+  ayuda|-h|--help|help) ayuda ;;
+  *) echo "orden desconocida: $orden" >&2; ayuda; exit 2 ;;
+esac

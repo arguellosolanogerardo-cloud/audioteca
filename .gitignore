@@ -1,0 +1,21 @@
+# Dependencias y entornos
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Tus datos: nunca al repo
+.env
+.data/
+.trabajo/
+biblioteca/
+voces/*
+!voces/LEEME.md
+
+# Generados por las pruebas
+app/fixtures/libros/
+app/tests/e2e/salida/
+
+# Notas locales de entrega
+ENTREGA.md
+.DS_Store

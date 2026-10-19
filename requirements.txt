@@ -1,0 +1,7 @@
+# Base: extraer PDF/EPUB y narrar con la voz de macOS (sin modelos de IA).
+numpy>=1.26
+soundfile>=0.13
+pypdf>=6.0
+ebooklib>=0.20
+beautifulsoup4>=4.12
+lxml>=5.0

@@ -1,0 +1,5 @@
+# IA local en Apple Silicon (MLX): voz Qwen3-TTS (narrar y clonar) y traductor Gemma 4.
+-r requirements.txt
+mlx-audio==0.5.0
+mlx-lm==0.32.2
+huggingface_hub>=1.0
