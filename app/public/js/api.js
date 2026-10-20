@@ -71,4 +71,48 @@ export const api = {
     if (r.status === 401) throw new SinSesion()
     return r.ok ? r.text() : null
   },
+  vocesDisponibles: () => pedir('api/voces-disponibles'),
+  tarea: (id) => pedir('api/tareas/' + e(id)),
+  subirPdf: (archivo, { titulo, autor, voz, slug } = {}, onProgreso = null) => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', 'api/libros/subir')
+      xhr.setRequestHeader('content-type', 'application/pdf')
+      if (titulo) xhr.setRequestHeader('x-titulo', encodeURIComponent(titulo))
+      if (autor) xhr.setRequestHeader('x-autor', encodeURIComponent(autor))
+      if (voz) xhr.setRequestHeader('x-voz', voz)
+      if (slug) xhr.setRequestHeader('x-slug', slug)
+
+      if (onProgreso && xhr.upload) {
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) {
+            const pct = Math.round((ev.loaded / ev.total) * 100)
+            onProgreso(pct)
+          }
+        }
+      }
+
+      xhr.onload = () => {
+        if (xhr.status === 401) return reject(new SinSesion())
+        try {
+          const res = JSON.parse(xhr.responseText)
+          if (xhr.status >= 200 && xhr.status < 300) resolve(res)
+          else reject(new Error(res.error || `Error ${xhr.status}`))
+        } catch {
+          reject(new Error('Respuesta del servidor no válida'))
+        }
+      }
+      xhr.onerror = () => reject(new Error('Error de conexión al subir el archivo'))
+      xhr.send(archivo)
+    })
+  },
+  eliminarLibro: (slug) => pedir(rutas.libro(slug), { method: 'DELETE' }).then((res) => {
+    olvidar('libros')
+    olvidar(`libro:${slug}`)
+    try {
+      localStorage.removeItem('audioteca.guardado.' + rutas.libro(slug))
+      localStorage.removeItem('audioteca.guardado.libros')
+    } catch {}
+    return res
+  }),
 }

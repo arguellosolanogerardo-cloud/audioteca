@@ -5,10 +5,11 @@
 import { createServer } from 'node:http'
 import { createServer as createServerTls } from 'node:https'
 import { networkInterfaces } from 'node:os'
-import { createReadStream, readFileSync, statSync, writeFileSync, renameSync, mkdirSync, realpathSync } from 'node:fs'
+import { createReadStream, createWriteStream, readFileSync, statSync, writeFileSync, renameSync, mkdirSync, realpathSync, existsSync, readdirSync, unlinkSync, rmdirSync } from 'node:fs'
 import { join, dirname, extname, posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { listarLibros, leerLibro, leerCapitulo, rutaAudio, SLUG, NN, VOZ } from './libros.mjs'
 import { crearVoces } from './voces.mjs'
 import { crearEstaticos, comprimir, TIPOS } from './estaticos.mjs'
@@ -24,6 +25,7 @@ export function configDesdeEntorno(env = entorno()) {
     puerto: Number(env.AUDIOTECA_PUERTO || 3410),
     host: env.AUDIOTECA_HOST || '0.0.0.0',
     libros: rutaDe(env.AUDIOTECA_LIBROS, 'biblioteca'),
+    trabajo,
     narrador: join(trabajo, 'narrador'),
     voces: rutaDe(env.AUDIOTECA_VOCES, 'voces'),
     datos: rutaDe(env.AUDIOTECA_DATOS, '.data'),
@@ -222,12 +224,205 @@ export function crearServidor(cfg = configDesdeEntorno()) {
       if (!/^application\/json/.test(req.headers['content-type'] || '')) return responder(res, 415, { error: 'se espera JSON' })
       const libro = leerLibro(cfg.libros, m[1])
       if (!libro) return responder(res, 404, { error: 'libro no encontrado' })
+      let tareaId = null
       if (req.method === 'DELETE') voces.cancelar(m[1], m[2])
       else {
         const motivo = voces.pedir(libro, m[2])
         if (motivo) return responder(res, 409, { error: motivo })
+
+        // Lanzar síntesis con Edge-TTS para esta voz en segundo plano
+        tareaId = 'voz-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+        const dirTareas = join(cfg.trabajo, 'tareas')
+        mkdirSync(dirTareas, { recursive: true })
+        writeFileSync(join(dirTareas, `${tareaId}.json`), JSON.stringify({
+          id: tareaId,
+          slug: m[1],
+          titulo: libro.titulo,
+          voz: m[2],
+          etapa: 'iniciado',
+          porcentaje: 5,
+          mensaje: `Preparando narración con la voz seleccionada...`,
+        }, null, 2))
+
+        const pythonProc = spawn('python', [
+          join(RAIZ_APP, '..', 'pipeline', 'procesar_libro.py'),
+          '--re-narrar', m[1],
+          '--voz', m[2],
+          '--tarea-id', tareaId,
+        ], {
+          cwd: join(RAIZ_APP, '..'),
+          stdio: ['ignore', 'ignore', 'ignore'],
+          detached: true,
+        })
+        pythonProc.unref()
       }
-      return responderDatos(req, res, fichaCompleta(m[1]))
+      return responderDatos(req, res, { ...fichaCompleta(m[1]), tareaId })
+    }
+
+    // Muestra de audio de una voz (preview)
+    m = /^\/api\/voces\/muestra\/([^/]+)\.mp3$/.exec(ruta)
+    if (m && req.method === 'GET') {
+      const vozId = m[1]
+      const rutaMuestra = join(cfg.datos, 'muestras', `${vozId}.mp3`)
+      if (existsSync(rutaMuestra)) {
+        return servirArchivo(req, res, rutaMuestra, { tipo: 'audio/mpeg' })
+      }
+      return responder(res, 404, { error: 'muestra no encontrada' })
+    }
+
+    // Lista de voces recomendadas para la subida
+    if (ruta === '/api/voces-disponibles' && req.method === 'GET') {
+      return responderDatos(req, res, {
+        voces: [
+          { id: 'edge-co-salome', nombre: 'Salomé (Colombia - Femenina)', genero: 'F', bandera: '🇨🇴', recomendado: true },
+          { id: 'edge-co-gonzalo', nombre: 'Gonzalo (Colombia - Masculina)', genero: 'M', bandera: '🇨🇴' },
+          { id: 'edge-es-alvaro', nombre: 'Álvaro (España - Masculina)', genero: 'M', bandera: '🇪🇸' },
+          { id: 'edge-es-elvira', nombre: 'Elvira (España - Femenina)', genero: 'F', bandera: '🇪🇸' },
+          { id: 'edge-mx-dalia', nombre: 'Dalia (México - Femenina)', genero: 'F', bandera: '🇲🇽' },
+          { id: 'edge-mx-jorge', nombre: 'Jorge (México - Masculina)', genero: 'M', bandera: '🇲🇽' },
+          { id: 'edge-ar-elena', nombre: 'Elena (Argentina - Femenina)', genero: 'F', bandera: '🇦🇷' },
+          { id: 'edge-ar-tomas', nombre: 'Tomás (Argentina - Masculina)', genero: 'M', bandera: '🇦🇷' },
+          { id: 'edge-cl-catalina', nombre: 'Catalina (Chile - Femenina)', genero: 'F', bandera: '🇨🇱' },
+          { id: 'edge-cl-lorenzo', nombre: 'Lorenzo (Chile - Masculina)', genero: 'M', bandera: '🇨🇱' },
+          { id: 'edge-pe-camila', nombre: 'Camila (Perú - Femenina)', genero: 'F', bandera: '🇵🇪' },
+          { id: 'edge-pe-alex', nombre: 'Alex (Perú - Masculina)', genero: 'M', bandera: '🇵🇪' },
+          { id: 'edge-ve-paola', nombre: 'Paola (Venezuela - Femenina)', genero: 'F', bandera: '🇻🇪' },
+          { id: 'edge-ve-sebastian', nombre: 'Sebastián (Venezuela - Masculina)', genero: 'M', bandera: '🇻🇪' },
+          { id: 'edge-us-paloma', nombre: 'Paloma (EE. UU. - Femenina)', genero: 'F', bandera: '🇺🇸' },
+          { id: 'edge-us-alonso', nombre: 'Alonso (EE. UU. - Masculina)', genero: 'M', bandera: '🇺🇸' },
+        ],
+      })
+    }
+
+    // Consulta de estado de una tarea de procesamiento
+    m = /^\/api\/tareas\/([^/]+)$/.exec(ruta)
+    if (m && req.method === 'GET') {
+      const tareaId = m[1]
+      const dirTareas = join(cfg.narrador, '..', 'tareas')
+      const rutaTarea = join(dirTareas, `${tareaId}.json`)
+      try {
+        if (existsSync(rutaTarea)) {
+          const contenido = JSON.parse(readFileSync(rutaTarea, 'utf8'))
+          return responderDatos(req, res, contenido)
+        }
+      } catch (e) {}
+      return responderDatos(req, res, { id: tareaId, etapa: 'iniciando', porcentaje: 0, mensaje: 'Iniciando procesamiento...' })
+    }
+
+    // Subida de PDF y procesamiento automático
+    if (ruta === '/api/libros/subir' && req.method === 'POST') {
+      const dirSubidas = join(cfg.narrador, '..', 'subidas')
+      const dirTareas = join(cfg.narrador, '..', 'tareas')
+      mkdirSync(dirSubidas, { recursive: true })
+      mkdirSync(dirTareas, { recursive: true })
+
+      const tareaId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+      const rutaPdf = join(dirSubidas, `${tareaId}.pdf`)
+      const writeStream = createWriteStream(rutaPdf)
+
+      let rawTitulo = req.headers['x-titulo'] || url.searchParams.get('titulo') || 'Nuevo Libro'
+      let rawAutor = req.headers['x-autor'] || url.searchParams.get('autor') || 'Desconocido'
+      let rawVoz = req.headers['x-voz'] || url.searchParams.get('voz') || 'edge-co-salome'
+      let rawSlug = req.headers['x-slug'] || url.searchParams.get('slug') || ''
+
+      try { rawTitulo = decodeURIComponent(rawTitulo) } catch {}
+      try { rawAutor = decodeURIComponent(rawAutor) } catch {}
+
+      if (!rawSlug) {
+        rawSlug = rawTitulo.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || `libro-${Date.now()}`
+      }
+      if (!SLUG.test(rawSlug)) rawSlug = `libro-${Date.now()}`
+
+      req.pipe(writeStream)
+
+      writeStream.on('error', () => {
+        responder(res, 500, { error: 'Error al recibir el archivo' })
+      })
+
+      writeStream.on('finish', () => {
+        const estadoInicial = {
+          id: tareaId,
+          slug: rawSlug,
+          titulo: rawTitulo,
+          autor: rawAutor,
+          voz: rawVoz,
+          etapa: 'subido',
+          porcentaje: 5,
+          mensaje: 'Archivo recibido. Iniciando análisis...',
+          inicio: new Date().toISOString(),
+        }
+        try {
+          writeFileSync(join(dirTareas, `${tareaId}.json`), JSON.stringify(estadoInicial, null, 2))
+        } catch {}
+
+        const pythonExe = process.platform === 'win32' ? 'python' : 'python3'
+        const scriptPy = join(RAIZ_APP, '..', 'pipeline', 'procesar_libro.py')
+
+        const child = spawn(pythonExe, [
+          scriptPy,
+          rutaPdf,
+          '--slug', rawSlug,
+          '--titulo', rawTitulo,
+          '--autor', rawAutor,
+          '--voz', rawVoz,
+          '--tarea-id', tareaId,
+        ], {
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: join(RAIZ_APP, '..'),
+        })
+
+        child.stdout.on('data', (d) => {
+          const str = d.toString('utf8')
+          for (const line of str.split('\n')) {
+            if (line.startsWith('__PROGRESS__')) {
+              try {
+                const prog = JSON.parse(line.slice(12))
+                writeFileSync(join(dirTareas, `${tareaId}.json`), JSON.stringify(prog, null, 2))
+              } catch {}
+            }
+          }
+        })
+
+        child.stderr.on('data', (d) => {
+          console.error(`[procesar_libro ${tareaId}]`, d.toString('utf8'))
+        })
+
+        child.unref()
+
+        return responderDatos(req, res, {
+          ok: true,
+          tareaId,
+          slug: rawSlug,
+          titulo: rawTitulo,
+          autor: rawAutor,
+        })
+      })
+
+      return
+    }
+
+    // Eliminar un libro completo de la biblioteca
+    m = /^\/api\/libros\/([^/]+)$/.exec(ruta)
+    if (m && req.method === 'DELETE') {
+      const slug = m[1]
+      if (!SLUG.test(slug)) return responder(res, 400, { error: 'slug inválido' })
+      const dirLibro = join(cfg.libros, slug)
+      if (!existsSync(dirLibro)) return responder(res, 404, { error: 'libro no encontrado' })
+      try {
+        const borrarDir = (dir) => {
+          for (const f of readdirSync(dir, { withFileTypes: true })) {
+            const p = join(dir, f.name)
+            if (f.isDirectory()) borrarDir(p)
+            else unlinkSync(p)
+          }
+          rmdirSync(dir)
+        }
+        borrarDir(dirLibro)
+        return responderDatos(req, res, { ok: true, eliminado: slug })
+      } catch (err) {
+        return responder(res, 500, { error: 'Error al eliminar libro' })
+      }
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') return responder(res, 405, { error: 'método no permitido' })

@@ -56,9 +56,20 @@ async function render() {
     if (!vigente(mio)) return
     if (e instanceof SinSesion) return vistaEntrada()
     console.error(e)
-    vista.innerHTML = `<div class="pagina"><div class="vacio">${esc(navigator.onLine ? e.message || 'Algo falló' : 'Sin conexión y sin copia en el teléfono.')}<br><br>
-      <button class="boton vidrio titanio" style="padding:0 20px" data-accion="reintentar">Reintentar</button></div></div>`
-    vista.querySelector('[data-accion="reintentar"]').onclick = render
+    vista.innerHTML = `
+      <div class="pagina">
+        <div class="tarjeta-error-amigable">
+          <div class="icono-err">🎧</div>
+          <h2>Ocurrió un problema al cargar</h2>
+          <p>${esc(navigator.onLine ? (e.message || 'No fue posible cargar el contenido.') : 'Sin conexión a internet ni copia local en el dispositivo.')}</p>
+          <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+            <button class="boton oro" data-accion="reintentar" style="padding:0 24px">🔄 Reintentar</button>
+            <button class="boton vidrio" data-accion="ir-inicio" style="padding:0 20px">🏠 Ir a la biblioteca</button>
+          </div>
+        </div>
+      </div>`
+    vista.querySelector('[data-accion="reintentar"]').onclick = () => { librosCache = null; render() }
+    vista.querySelector('[data-accion="ir-inicio"]').onclick = () => { location.hash = '#/'; librosCache = null; render() }
   }
   pintarMini()
 }
@@ -129,13 +140,240 @@ async function descargadoCompleto(l) {
   return true
 }
 
+// ── Subida de libros (PDF) y tareas activas ──────────────────────────────
+let tareaActiva = null
+try { tareaActiva = JSON.parse(localStorage.getItem('audioteca_tarea_activa') || 'null') } catch {}
+let intervaloTarea = null
+
+// Modal de confirmación amigable (sin usar confirm() nativo feo)
+function mostrarConfirmacion({ titulo, mensaje, textoBoton = 'Eliminar', peligro = true, onConfirmar }) {
+  abrirHoja(`
+    <div class="modal-confirmacion">
+      <div class="modal-icono-alerta">${peligro ? icono.basura : icono.auriculares}</div>
+      <div class="modal-tit">${esc(titulo)}</div>
+      <div class="modal-desc">${esc(mensaje)}</div>
+      <div class="modal-acciones">
+        <button class="boton vidrio titanio" data-h="cerrar" style="flex:1">Cancelar</button>
+        <button class="boton ${peligro ? 'peligro' : 'oro'}" id="btn-modal-confirmar" style="flex:1">${esc(textoBoton)}</button>
+      </div>
+    </div>
+  `)
+  const btn = hoja.querySelector('#btn-modal-confirmar')
+  if (btn) {
+    btn.onclick = async () => {
+      cerrarHoja()
+      await onConfirmar?.()
+    }
+  }
+}
+
+// Reproductor de muestras de voz
+let audioMuestra = null
+function reproducirMuestraVoz(vozId) {
+  if (!audioMuestra) audioMuestra = new Audio()
+  if (!audioMuestra.paused) {
+    audioMuestra.pause()
+    const previa = audioMuestra.dataset.voz
+    document.querySelectorAll('.boton-muestra-voz').forEach((b) => b.classList.remove('sonando'))
+    if (previa === vozId) return
+  }
+  document.querySelectorAll('.boton-muestra-voz').forEach((b) => b.classList.toggle('sonando', b.dataset.voz === vozId))
+  audioMuestra.src = `api/voces/muestra/${encodeURIComponent(vozId)}.mp3`
+  audioMuestra.dataset.voz = vozId
+  audioMuestra.onended = () => {
+    document.querySelectorAll('.boton-muestra-voz').forEach((b) => b.classList.remove('sonando'))
+  }
+  audioMuestra.play().catch(() => {
+    avisar('Muestra de voz no disponible')
+    document.querySelectorAll('.boton-muestra-voz').forEach((b) => b.classList.remove('sonando'))
+  })
+}
+
+function htmlTarjetaTarea() {
+  if (!tareaActiva) return ''
+  const t = tareaActiva
+  const pct = Math.min(100, Math.max(0, t.porcentaje || 5))
+  const esFin = t.etapa === 'completado'
+  const esError = t.etapa === 'error'
+
+  return `
+    <div class="tarjeta-tarea-activa" id="tarjeta-tarea-progreso">
+      <div class="cab-tarea">
+        <div class="titulo-tarea">
+          ${esFin ? `<span style="color:var(--ok)">${icono.check}</span>` : esError ? `<span style="color:var(--mal)">⚠️</span>` : `<span style="color:var(--oro)">${icono.cargando}</span>`}
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px">${esc(t.titulo || 'Procesando libro')}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="pct-tarea num">${esFin ? '100%' : `${pct}%`}</span>
+          ${esFin || esError ? `<button class="boton-icono" style="width:28px;height:28px;font-size:16px" data-cerrar-tarea aria-label="Cerrar aviso">✕</button>` : ''}
+        </div>
+      </div>
+      <div class="barra"><i style="width:${pct}%"></i></div>
+      <div class="msg-tarea">${esc(t.mensaje || 'Analizando documento y preparando audiolibro...')}</div>
+      ${esFin ? `
+        <a class="boton oro btn-escuchar-ya" href="#/leer/${esc(t.slug)}/01">
+          ${icono.play} Escuchar audiolibro ahora
+        </a>
+      ` : ''}
+    </div>`
+}
+
+function iniciarMonitoreoTarea(alCambiar, alTerminar) {
+  if (intervaloTarea || !tareaActiva || tareaActiva.etapa === 'completado' || tareaActiva.etapa === 'error') return
+  intervaloTarea = setInterval(async () => {
+    if (!tareaActiva?.id) { clearInterval(intervaloTarea); intervaloTarea = null; return }
+    try {
+      const info = await api.tarea(tareaActiva.id)
+      if (info && info.id) {
+        tareaActiva = { ...tareaActiva, ...info }
+        localStorage.setItem('audioteca_tarea_activa', JSON.stringify(tareaActiva))
+        alCambiar?.(tareaActiva)
+        if (tareaActiva.etapa === 'completado' || tareaActiva.etapa === 'error') {
+          clearInterval(intervaloTarea)
+          intervaloTarea = null
+          alTerminar?.(tareaActiva)
+        }
+      }
+    } catch (e) {
+      console.warn('Error consultando tarea:', e)
+    }
+  }, 1600)
+}
+
+async function hojaSubirPdf(alIniciar) {
+  let voces = [
+    { id: 'edge-co-salome', nombre: 'Salomé (Colombia - Femenina)', bandera: '🇨🇴', recomendado: true },
+    { id: 'edge-co-gonzalo', nombre: 'Gonzalo (Colombia - Masculina)', bandera: '🇨🇴' },
+    { id: 'edge-es-alvaro', nombre: 'Álvaro (España - Masculina)', bandera: '🇪🇸' },
+    { id: 'edge-es-elvira', nombre: 'Elvira (España - Femenina)', bandera: '🇪🇸' },
+    { id: 'edge-mx-dalia', nombre: 'Dalia (México - Femenina)', bandera: '🇲🇽' },
+    { id: 'edge-mx-jorge', nombre: 'Jorge (México - Masculina)', bandera: '🇲🇽' },
+  ]
+  try {
+    const res = await api.vocesDisponibles()
+    if (res?.voces?.length) voces = res.voces
+  } catch {}
+
+  const opcionesVoces = voces.map((v) =>
+    `<option value="${esc(v.id)}" ${v.recomendado ? 'selected' : ''}>${esc(v.bandera || '🎙️')} ${esc(v.nombre)}</option>`
+  ).join('')
+
+  abrirHoja(`
+    <h3 style="margin-bottom:4px">Convertir PDF en Audiolibro</h3>
+    <div style="font-size:13.5px;color:var(--muted);margin-bottom:18px">Convierte tu documento en audio con voces humanas de alta calidad.</div>
+    <div class="zona-subida" id="zona-drop">
+      <div class="icono-zona" id="icono-zona-estado">${icono.subir}</div>
+      <div class="txt-principal" id="txt-nombre-archivo">Elige o arrastra un libro en PDF</div>
+      <div class="txt-secundario" id="txt-tamano-archivo">Documentos PDF de texto (hasta 100 MB)</div>
+      <input type="file" id="input-archivo-pdf" accept=".pdf,application/pdf" style="display:none">
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:12px;margin-top:14px">
+      <div>
+        <label style="font-size:13px;font-weight:600;color:var(--texto-2);display:block;margin-bottom:6px">Título del libro</label>
+        <input class="campo" type="text" id="campo-titulo" placeholder="Ej. El Principito" style="width:100%">
+      </div>
+      <div>
+        <label style="font-size:13px;font-weight:600;color:var(--texto-2);display:block;margin-bottom:6px">Autor / Autora <span style="color:var(--muted);font-weight:400">(opcional)</span></label>
+        <input class="campo" type="text" id="campo-autor" placeholder="Ej. Antoine de Saint-Exupéry" style="width:100%">
+      </div>
+      <div>
+        <label style="font-size:13px;font-weight:600;color:var(--texto-2);display:block;margin-bottom:6px">Voz de la narración</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select class="campo" id="campo-voz" style="flex:1;cursor:pointer">
+            ${opcionesVoces}
+          </select>
+          <button type="button" class="boton vidrio titanio" id="btn-probar-voz-modal" style="height:52px;padding:0 16px;flex:none;gap:6px" title="Escuchar muestra de esta voz">
+            ${icono.play} <span>Muestra</span>
+          </button>
+        </div>
+      </div>
+
+      <button class="boton oro" id="btn-crear-audiolibro" disabled style="width:100%;margin-top:10px;height:48px;font-size:15.5px">
+        ${icono.chispa} Iniciar creación del audiolibro
+      </button>
+      <div id="msg-subida-error" style="color:var(--mal);font-size:13px;text-align:center;min-height:18px"></div>
+    </div>
+  `)
+
+  const zona = hoja.querySelector('#zona-drop')
+  const iconoZona = hoja.querySelector('#icono-zona-estado')
+  const input = hoja.querySelector('#input-archivo-pdf')
+  const txtNombre = hoja.querySelector('#txt-nombre-archivo')
+  const txtTam = hoja.querySelector('#txt-tamano-archivo')
+  const campoTitulo = hoja.querySelector('#campo-titulo')
+  const campoAutor = hoja.querySelector('#campo-autor')
+  const campoVoz = hoja.querySelector('#campo-voz')
+  const btnCrear = hoja.querySelector('#btn-crear-audiolibro')
+  const btnProbarVozModal = hoja.querySelector('#btn-probar-voz-modal')
+  const msgError = hoja.querySelector('#msg-subida-error')
+
+  if (btnProbarVozModal) {
+    btnProbarVozModal.onclick = () => reproducirMuestraVoz(campoVoz.value)
+  }
+
+  let archivoSeleccionado = null
+
+  const procesarArchivo = (file) => {
+    if (!file || !file.name.toLowerCase().endsWith('.pdf')) {
+      msgError.textContent = 'Por favor selecciona un archivo con extensión .pdf'
+      return
+    }
+    archivoSeleccionado = file
+    msgError.textContent = ''
+    iconoZona.innerHTML = `<span style="color:var(--ok)">${icono.check}</span>`
+    iconoZona.style.background = 'rgba(63, 178, 127, 0.2)'
+    txtNombre.innerHTML = `<strong>${esc(file.name)}</strong>`
+    txtTam.textContent = `${megas(file.size)} · Archivo listo`
+    if (!campoTitulo.value) {
+      campoTitulo.value = file.name.replace(/\.pdf$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+    }
+    btnCrear.disabled = false
+  }
+
+  zona.onclick = () => input.click()
+  input.onchange = () => { if (input.files[0]) procesarArchivo(input.files[0]) }
+
+  zona.ondragover = (ev) => { ev.preventDefault(); zona.classList.add('dragover') }
+  zona.ondragleave = () => zona.classList.remove('dragover')
+  zona.ondrop = (ev) => {
+    ev.preventDefault()
+    zona.classList.remove('dragover')
+    if (ev.dataTransfer.files[0]) procesarArchivo(ev.dataTransfer.files[0])
+  }
+
+  btnCrear.onclick = async () => {
+    if (!archivoSeleccionado) return
+    const titulo = campoTitulo.value.trim() || 'Nuevo Libro'
+    const autor = campoAutor.value.trim() || 'Desconocido'
+    const voz = campoVoz.value || 'edge-co-salome'
+
+    btnCrear.disabled = true
+    btnCrear.innerHTML = `${icono.cargando} Subiendo archivo...`
+    msgError.textContent = ''
+
+    try {
+      const resp = await api.subirPdf(archivoSeleccionado, { titulo, autor, voz }, (pct) => {
+        btnCrear.innerHTML = `${icono.cargando} Subiendo... ${pct}%`
+      })
+      cerrarHoja()
+      avisar('¡PDF subido! Procesando audiolibro...')
+      alIniciar?.(resp, { titulo, autor, voz })
+    } catch (err) {
+      btnCrear.disabled = false
+      btnCrear.innerHTML = `${icono.play} Reintentar creación`
+      msgError.textContent = err.message || 'Error al subir el archivo'
+    }
+  }
+}
+
 async function vistaBiblioteca(mio) {
-  if (!librosCache) vista.innerHTML = `<div class="pagina"><div class="cabecera"><h1 class="titulo-grande">Audioteca</h1></div></div>`
+  if (!librosCache) vista.innerHTML = `<div class="pagina"><div class="cabecera"><h1 class="titulo-grande">Audio<em>teca</em></h1></div></div>`
   let pintado = ''
   // `datos` = copia local (primera pintura al instante); sin argumento = red. Solo repinta si algo cambió.
   const pintar = async (datos = null) => {
     const { libros } = datos || (await api.libros())
-    const firma = JSON.stringify(libros) + JSON.stringify(progresos())
+    const firma = JSON.stringify(libros) + JSON.stringify(progresos()) + JSON.stringify(tareaActiva)
     if (firma === pintado) return
     pintado = firma
     librosCache = libros
@@ -175,27 +413,162 @@ async function vistaBiblioteca(mio) {
     const tomos = orden.map((l) => {
       const e = estadoLibro(l)
       const p = progs[l.slug]
+      const totalCaps = typeof l.capitulos === 'number' ? l.capitulos : (l.capitulos?.length || 0)
+      const duracionTxt = l.duracion ? duracionHumana(l.duracion) : (totalCaps ? `${totalCaps} caps` : 'En preparación')
+      const pctProgreso = p?.fin ? 100 : (p?.t && l.duracion ? Math.min(99, Math.round((p.t / l.duracion) * 100)) : 0)
+
       return `
-        <a class="tomo" href="#/libro/${esc(l.slug)}" data-slug="${esc(l.slug)}" style="${l.capitulos ? '' : 'opacity:.55'}">
-          <div style="position:relative">${portadaHtml(l)}<span class="insignia" hidden>${icono.descargado}</span></div>
-          ${p ? `<div class="barra" data-fraccion="${esc(l.slug)}"><i style="width:0%"></i></div>` : ''}
-          <h3>${esc(l.titulo)}</h3>
-          <div class="autor">${esc(l.autor)}</div>
-          ${p ? `<div class="avance-tomo num" data-avance="${esc(l.slug)}">${p.fin ? 'Terminado' : 'En curso'}</div>` : ''}
-          <div class="estado ${e.clase}"><span class="punto"></span>${esc(e.texto)}</div>
-        </a>`
+        <div class="tarjeta-libro" data-slug="${esc(l.slug)}" data-titulo="${esc(l.titulo).toLowerCase()}" data-autor="${esc(l.autor || '').toLowerCase()}">
+          <div class="tarjeta-libro-top" data-ir="#/libro/${esc(l.slug)}">
+            <div style="position:relative">
+              ${portadaHtml(l)}
+              <span class="insignia" hidden>${icono.descargado}</span>
+            </div>
+            ${p ? `<div class="barra" data-fraccion="${esc(l.slug)}" style="margin-top:8px"><i style="width:${pctProgreso}%"></i></div>` : ''}
+          </div>
+          <div class="tarjeta-libro-info">
+            <h3 class="tarjeta-libro-titulo" data-ir="#/libro/${esc(l.slug)}" title="${esc(l.titulo)}">${esc(l.titulo)}</h3>
+            <div class="tarjeta-libro-autor">${esc(l.autor || 'Autor desconocido')}</div>
+            <div class="tarjeta-libro-pildoras">
+              <span class="pildora"><span style="opacity:0.8">${icono.relojIcon}</span> ${duracionTxt}</span>
+              ${p?.fin ? `<span class="pildora ok">✓ Terminado</span>` : p ? `<span class="pildora oro" data-avance="${esc(l.slug)}">En curso</span>` : `<span class="pildora">Listo</span>`}
+            </div>
+          </div>
+          <div class="tarjeta-libro-acciones">
+            <button class="btn-card-escuchar" data-escuchar-card="${esc(l.slug)}" title="Reproducir audiolibro">
+              ${R.elemento.paused || R.estado.libro?.slug !== l.slug ? icono.play : icono.pausa} <span>Escuchar</span>
+            </button>
+            <a class="btn-card-leer" href="#/libro/${esc(l.slug)}" title="Ver capítulos y detalles">
+              ${icono.libro} <span>Ver</span>
+            </a>
+            <button class="btn-card-borrar" data-borrar-card="${esc(l.slug)}" data-titulo-libro="${esc(l.titulo)}" title="Eliminar de la biblioteca" aria-label="Eliminar libro">
+              ${icono.basura}
+            </button>
+          </div>
+        </div>`
     }).join('')
+
     vista.innerHTML = `
       <div class="pagina">
-        <div class="cabecera"><h1 class="titulo-grande">Audio<em>teca</em></h1>
-          <a class="boton-icono" href="#/ajustes" aria-label="Ajustes y descargas">${icono.ajustes}</a></div>
+        <div class="cabecera-moderna">
+          <div class="marca-bloque">
+            <h1 class="marca-tit titulo-grande">
+              <span class="logo-aura">${icono.auriculares}</span>
+              <span>Audio<em>teca</em></span>
+            </h1>
+            <div class="subtitulo-marca">Audiolibros inteligentes con voz natural humana</div>
+          </div>
+          <div class="acciones-cabecera">
+            <button class="boton-subir-destacado" data-accion="subir-pdf" aria-label="Subir libro PDF">
+              ${icono.mas} <span>Subir PDF</span>
+            </button>
+            <a class="boton-icono" href="#/ajustes" aria-label="Ajustes y descargas" title="Ajustes">${icono.ajustes}</a>
+          </div>
+        </div>
+
+        ${htmlTarjetaTarea()}
         ${continuar}
-        ${libros.length ? `<div class="seccion">Tu biblioteca</div><div class="estante">${tomos}</div>`
-          : `<div class="vacio">Todavía no hay libros.<br>El narrador de tu Mac los irá dejando aquí.</div>`}
+
+        ${libros.length ? `
+          <div class="barra-busqueda-wrap">
+            <span class="icono-busq">${icono.buscar}</span>
+            <input type="text" class="campo-busqueda" placeholder="Buscar audiolibro por título o autor..." id="input-busqueda-libros">
+            <button class="btn-limpiar-busq" id="btn-limpiar-busqueda" hidden aria-label="Limpiar búsqueda">✕</button>
+          </div>
+          <div class="seccion" style="display:flex;justify-content:space-between;align-items:center">
+            <span>Tu biblioteca</span>
+            <span style="font-weight:500;font-size:12px;text-transform:none;letter-spacing:0">${libros.length} ${libros.length === 1 ? 'libro' : 'libros'}</span>
+          </div>
+          <div class="estante-moderno">${tomos}</div>
+        ` : `
+          <div class="onboarding-vacio">
+            <div class="onboarding-icono">${icono.chispa}</div>
+            <h2 class="onboarding-tit">¡Bienvenido a tu Audioteca!</h2>
+            <p class="onboarding-desc">Convierte fácilmente cualquier archivo PDF en un audiolibro narrado con voces naturales de Colombia, España, México y más países.</p>
+            <div class="pasos-onboarding">
+              <div class="paso-card">
+                <span class="paso-num">Paso 1</span>
+                <span class="paso-tit">📄 Sube tu archivo</span>
+                <span class="paso-txt">Arrastra cualquier documento PDF con libros, notas o lecturas.</span>
+              </div>
+              <div class="paso-card">
+                <span class="paso-num">Paso 2</span>
+                <span class="paso-tit">🎙️ Elige tu voz</span>
+                <span class="paso-txt">Escucha muestras de audio y selecciona tu acento preferido.</span>
+              </div>
+              <div class="paso-card">
+                <span class="paso-num">Paso 3</span>
+                <span class="paso-tit">🎧 Escucha y disfruta</span>
+                <span class="paso-txt">Reproduce a cualquier velocidad con texto sincronizado en tiempo real.</span>
+              </div>
+            </div>
+            <button class="boton-subir-destacado" data-accion="subir-pdf" style="height:50px;padding:0 28px;font-size:16px;margin:0 auto">
+              ${icono.subir} Subir mi primer PDF
+            </button>
+          </div>
+        `}
       </div>`
-    vista.querySelector('[data-ir]')?.addEventListener('click', (ev) => {
-      if (ev.target.closest('[data-continuar]')) return
-      ir(ev.currentTarget.dataset.ir)
+
+    // Buscador interactivo
+    const inputBusq = vista.querySelector('#input-busqueda-libros')
+    const btnLimpiar = vista.querySelector('#btn-limpiar-busqueda')
+    if (inputBusq) {
+      inputBusq.oninput = () => {
+        const q = inputBusq.value.trim().toLowerCase()
+        if (btnLimpiar) btnLimpiar.hidden = !q
+        vista.querySelectorAll('.tarjeta-libro').forEach((c) => {
+          const tit = c.dataset.titulo || ''
+          const aut = c.dataset.autor || ''
+          c.style.display = (!q || tit.includes(q) || aut.includes(q)) ? '' : 'none'
+        })
+      }
+      if (btnLimpiar) {
+        btnLimpiar.onclick = () => {
+          inputBusq.value = ''
+          inputBusq.oninput()
+          inputBusq.focus()
+        }
+      }
+    }
+
+    vista.querySelectorAll('[data-accion="subir-pdf"]').forEach((btn) => {
+      btn.onclick = () => {
+        hojaSubirPdf((resp, meta) => {
+          tareaActiva = {
+            id: resp.tareaId,
+            slug: resp.slug,
+            titulo: meta.titulo,
+            autor: meta.autor,
+            voz: meta.voz,
+            etapa: 'iniciado',
+            porcentaje: 5,
+            mensaje: 'Iniciando análisis del PDF...',
+          }
+          localStorage.setItem('audioteca_tarea_activa', JSON.stringify(tareaActiva))
+          librosCache = null
+          pintar()
+          iniciarMonitoreoTarea(
+            () => pintar(),
+            (fin) => {
+              librosCache = null
+              api.libros().then(() => pintar()).catch(() => {})
+              avisar(fin.etapa === 'completado' ? '¡Audiolibro completado!' : 'Error en procesamiento')
+            }
+          )
+        })
+      }
+    })
+    vista.querySelector('[data-cerrar-tarea]')?.addEventListener('click', (ev) => {
+      ev.stopPropagation()
+      tareaActiva = null
+      localStorage.removeItem('audioteca_tarea_activa')
+      pintar()
+    })
+    vista.querySelectorAll('[data-ir]').forEach((el) => {
+      el.addEventListener('click', (ev) => {
+        if (ev.target.closest('[data-continuar],[data-escuchar-card],[data-borrar-card]')) return
+        ir(el.dataset.ir)
+      })
     })
     vista.querySelector('[data-continuar]')?.addEventListener('click', async (ev) => {
       ev.stopPropagation()
@@ -204,6 +577,48 @@ async function vistaBiblioteca(mio) {
       const p = progreso(slug)
       await R.cargar(slug, p.cap, { reproducir: true }).catch((e) => avisar(e.message))
     })
+    vista.querySelectorAll('[data-escuchar-card]').forEach((btn) => {
+      btn.onclick = async (ev) => {
+        ev.stopPropagation()
+        const slug = btn.dataset.escucharCard
+        if (R.estado.libro?.slug === slug) return R.alternar()
+        const p = progreso(slug)
+        await R.cargar(slug, p?.cap || 1, { reproducir: true }).catch((e) => avisar(e.message))
+      }
+    })
+    vista.querySelectorAll('[data-borrar-card]').forEach((btn) => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation()
+        const slug = btn.dataset.borrarCard
+        const tit = btn.dataset.tituloLibro || 'este audiolibro'
+        mostrarConfirmacion({
+          titulo: '¿Eliminar audiolibro?',
+          mensaje: `¿Estás seguro de que deseas eliminar «${tit}» de tu biblioteca?`,
+          textoBoton: 'Sí, eliminar',
+          peligro: true,
+          onConfirmar: async () => {
+            try {
+              await api.eliminarLibro(slug)
+              avisar('Audiolibro eliminado de la biblioteca')
+              librosCache = null
+              pintar()
+            } catch (err) {
+              avisar(err.message || 'Error al eliminar el audiolibro')
+            }
+          }
+        })
+      }
+    })
+    if (tareaActiva && tareaActiva.etapa !== 'completado' && tareaActiva.etapa !== 'error') {
+      iniciarMonitoreoTarea(
+        () => pintar(),
+        (fin) => {
+          librosCache = null
+          api.libros().then(() => pintar()).catch(() => {})
+          avisar(fin.etapa === 'completado' ? '¡Audiolibro completado!' : 'Error en procesamiento')
+        }
+      )
+    }
     // Detalles que requieren más datos llegan después, sin bloquear la primera pintura.
     for (const l of libros) {
       descargadoCompleto(l).then((ok) => { const i = vista.querySelector(`[data-slug="${CSS.escape(l.slug)}"] .insignia`); if (i) i.hidden = !ok })
@@ -277,7 +692,10 @@ async function vistaLibro(slug, mio) {
     vista.innerHTML = `
       <div class="pagina ficha" style="--tono:${tonoDe(slug)}">
         <div class="ficha-fondo"></div>
-        <div class="ficha-top"><a class="boton-icono" href="#/" aria-label="Biblioteca">${icono.atras}</a></div>
+        <div class="ficha-top">
+          <a class="boton-icono" href="#/" aria-label="Biblioteca">${icono.atras}</a>
+          <button class="boton-icono peligro" data-accion="eliminar-libro" title="Eliminar libro" aria-label="Eliminar libro">${icono.basura}</button>
+        </div>
         <div class="ficha-cabeza">
           ${portadaHtml(libro)}
           <h1>${esc(libro.titulo)}</h1>
@@ -311,6 +729,29 @@ async function vistaLibro(slug, mio) {
     const b = ev.target.closest('[data-accion],[data-cap],[data-voz]')
     if (!b) return
     const accion = b.dataset.accion
+    if (accion === 'eliminar-libro') {
+      mostrarConfirmacion({
+        titulo: '¿Eliminar audiolibro?',
+        mensaje: `¿Estás seguro de que deseas eliminar «${libro.titulo}» de tu biblioteca? Se borrarán todos los capítulos y audios.`,
+        textoBoton: 'Sí, eliminar',
+        peligro: true,
+        onConfirmar: async () => {
+          try {
+            await api.eliminarLibro(slug)
+            avisar('Libro eliminado de la biblioteca')
+            librosCache = null
+            ir('#/')
+          } catch (err) {
+            avisar(err.message || 'Error al eliminar el libro')
+          }
+        }
+      })
+      return
+    }
+    if (accion === 'muestra-voz') {
+      reproducirMuestraVoz(b.dataset.voz)
+      return
+    }
     if (b.dataset.voz) return accionVoz(libro, b.dataset.voz, accion, actualizar)
     if (b.dataset.cap) {
       const c = libro.capitulos.find((x) => x.n === Number(b.dataset.cap))
@@ -372,13 +813,13 @@ function estadoVoz(v, libro) {
   if (v.completa) return `Completa · ${duracionHumana(v.duracion)}`
   if (v.narrados) return `${v.narrados} de ${v.total} capítulos${narrando ? ` · ${narrando}` : v.enCola ? ' · en cola' : ''}`
   if (narrando) return narrando.charAt(0).toUpperCase() + narrando.slice(1)
-  if (v.pedida) return 'Pedida · primero el capítulo 1 como muestra'
-  if (v.enCola) return 'En la cola del narrador'
-  if (v.pedible) return 'Puedes pedirla a tu Mac'
-  return v.disponible ? libro.motivo || 'No disponible para este libro' : 'Ya no está en tu Mac'
+  if (v.pedida) return 'Generando narración en segundo plano...'
+  if (v.enCola) return 'En la cola para narrar'
+  if (v.pedible) return 'Disponible para narrar'
+  return v.disponible ? libro.motivo || 'No disponible para este libro' : 'No disponible'
 }
 
-/** Sección «Voces» de la ficha: elegir entre las narraciones que hay y pedir otras a tu Mac. */
+/** Sección «Voces» de la ficha: elegir entre las narraciones que hay y narrar en otras voces. */
 function seccionVoces(libro) {
   const voces = libro.voces || []
   if (!voces.length) return ''
@@ -388,15 +829,17 @@ function seccionVoces(libro) {
     let lado = ''
     if (on) lado = `<span class="voz-ok" aria-label="Elegida">${icono.descargado}</span>`
     else if (v.narrados) lado = '<span class="voz-elegir">Elegir</span>'
-    else if (v.pedible) lado = `<span class="chip voz-pedir" data-voz="${esc(v.id)}" data-accion="pedir">Pedir</span>`
+    else if (v.pedible) lado = `<span class="chip voz-pedir" data-voz="${esc(v.id)}" data-accion="pedir">Narrar</span>`
     else if (v.pedida && !v.narrando.length) lado = `<span class="chip" data-voz="${esc(v.id)}" data-accion="cancelar-voz">Cancelar</span>`
     const avance = v.total ? Math.round((100 * v.narrados) / v.total) : 0
-    return `<li><div class="voz ${on ? 'on' : ''} ${v.narrados ? 'elegible' : ''}" ${v.narrados ? `role="button" tabindex="0" data-voz="${esc(v.id)}" data-accion="elegir"` : ''}>
+    const esMuestra = v.id.startsWith('edge-')
+    const btnMuestra = esMuestra ? `<button class="boton-muestra-voz ${audioMuestra?.dataset.voz === v.id && !audioMuestra.paused ? 'sonando' : ''}" data-accion="muestra-voz" data-voz="${esc(v.id)}" title="Escuchar muestra de ${esc(v.nombre)}" aria-label="Escuchar muestra">${icono.play}</button>` : ''
+    return `<li><div class="voz ${on ? 'on' : ''} ${v.narrados ? 'elegible' : ''}">
       <span class="voz-sello" aria-hidden="true">${esc(v.nombre.charAt(0))}</span>
-      <span class="voz-cuerpo"><span class="t">${esc(v.nombre)}${v.principal ? ' <small>· voz del libro</small>' : ''}</span>
+      <span class="voz-cuerpo" ${v.narrados ? `role="button" tabindex="0" data-voz="${esc(v.id)}" data-accion="elegir"` : ''}><span class="t">${esc(v.nombre)}${v.principal ? ' <small>· voz del libro</small>' : ''}</span>
         <span class="s num">${esc(estadoVoz(v, libro))}</span>
         ${v.narrados && !v.completa ? `<span class="voz-barra"><i style="width:${avance}%"></i></span>` : ''}</span>
-      <span class="lado">${lado}</span></div></li>`
+      <span class="lado" style="display:flex;align-items:center;gap:6px">${btnMuestra}${lado}</span></div></li>`
   }).join('')
   return `<div class="seccion">Voces</div><ul class="voces">${filas}</ul>`
 }
@@ -413,14 +856,43 @@ async function accionVoz(libro, voz, accion, actualizar) {
     }
     if (accion === 'cancelar-voz') return actualizar(await api.cancelarVoz(libro.slug, voz)).then(() => avisar('Pedido cancelado'))
     if (accion === 'pedir') {
-      const primero = libro.capitulos.find((c) => c.texto)
-      abrirHoja(`<h3>${esc(libro.titulo)} en la voz de ${esc(v.nombre)}</h3>
-        <p class="hoja-texto">Tu Mac narra primero <b>${esc(primero?.titulo || 'el capítulo 1')}</b> como muestra, antes que lo demás de la cola, y el resto del libro cuando termine lo que ya está en cola. Aparecerá aquí en «Voces».</p>
-        <button class="opcion oro-texto" data-h="si">Pedir esta voz</button>
-        <button class="opcion" data-h="no">Cancelar</button>`, async (op) => {
-        if (op !== 'si') return
-        try { await actualizar(await api.pedirVoz(libro.slug, voz)); avisar(`Pedida: ${v.nombre}`) } catch (e) { avisar(e.message) }
+      mostrarConfirmacion({
+        titulo: `¿Narrar con ${v.nombre}?`,
+        mensaje: `Se generará la narración de «${libro.titulo}» con la voz de ${v.nombre} en segundo plano.`,
+        textoBoton: 'Generar narración',
+        peligro: false,
+        onConfirmar: async () => {
+          try {
+            const resp = await api.pedirVoz(libro.slug, voz)
+            avisar(`Iniciando narración con ${v.nombre}...`)
+            if (resp?.tareaId) {
+              tareaActiva = {
+                id: resp.tareaId,
+                slug: libro.slug,
+                titulo: libro.titulo,
+                voz,
+                etapa: 'iniciado',
+                porcentaje: 5,
+                mensaje: `Iniciando narración con la voz de ${v.nombre}...`,
+              }
+              localStorage.setItem('audioteca_tarea_activa', JSON.stringify(tareaActiva))
+              iniciarMonitoreoTarea(
+                () => { api.libro(libro.slug).then((l) => actualizar(l)).catch(() => {}) },
+                async () => {
+                  librosCache = null
+                  const l = await api.libro(libro.slug).catch(() => null)
+                  if (l) actualizar(l)
+                  avisar(`¡Narración con ${v.nombre} completada!`)
+                }
+              )
+            }
+            await actualizar(await api.libro(libro.slug))
+          } catch (e) {
+            avisar(e.message || 'Error al solicitar narración')
+          }
+        }
       })
+      return
     }
   } catch (e) {
     if (e instanceof SinSesion) return vistaEntrada()
