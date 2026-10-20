@@ -3,7 +3,7 @@
 // narraciones tiene cada libro, cuáles van en la cola del narrador y cuál está sonando ahora. La app solo
 // escribe `pedidos.json` (las voces que pides desde el teléfono); `cola.json` y `estado.json` son del narrador.
 export const VOZ_SISTEMA = 'macos'
-import { readdirSync, existsSync, writeFileSync, renameSync, readFileSync } from 'node:fs'
+import { readdirSync, existsSync, writeFileSync, renameSync, readFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { leerJson, VOZ } from './libros.mjs'
@@ -28,6 +28,13 @@ function vivo(pid) {
 export function crearVoces({ voces: dirVoces, narrador: dirNarrador }) {
   const rutaPedidos = join(dirNarrador, 'pedidos.json')
 
+  const VOCES_EDGE_IDS = [
+    'edge-co-salome', 'edge-co-gonzalo', 'edge-es-alvaro', 'edge-es-elvira',
+    'edge-mx-dalia', 'edge-mx-jorge', 'edge-ar-elena', 'edge-ar-tomas',
+    'edge-cl-catalina', 'edge-cl-lorenzo', 'edge-pe-camila', 'edge-pe-alex',
+    'edge-ve-paola', 'edge-ve-sebastian', 'edge-us-paloma', 'edge-us-alonso',
+  ]
+
   function disponibles() {
     let archivos = []
     try { archivos = readdirSync(dirVoces) } catch { archivos = [] }
@@ -37,7 +44,7 @@ export function crearVoces({ voces: dirVoces, narrador: dirNarrador }) {
       .map((n) => `${n}-clon`)
       .filter((id) => VOZ.test(id))
       .sort()
-      .concat(VOZ_SISTEMA)
+      .concat(VOZ_SISTEMA, ...VOCES_EDGE_IDS)
   }
 
   const cola = () => leerJson(join(dirNarrador, 'cola.json')) || {}
@@ -111,6 +118,7 @@ export function crearVoces({ voces: dirVoces, narrador: dirNarrador }) {
   }
 
   function guardarPedidos(lista) {
+    mkdirSync(dirNarrador, { recursive: true })
     const tmp = `${rutaPedidos}.${process.pid}.tmp`
     writeFileSync(tmp, JSON.stringify({
       nota: 'Lo escribe la Audioteca cuando pides otra voz desde el teléfono. El narrador hace primero el capítulo 1 como muestra y el resto del libro al final de la cola. Ver cola.json.',

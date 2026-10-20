@@ -1,4 +1,20 @@
 {
   "macos": "Voz de macOS",
-  "qwen": "Qwen (genérica)"
+  "qwen": "Qwen (genérica)",
+  "edge-co-salome": "Salomé (Colombia)",
+  "edge-co-gonzalo": "Gonzalo (Colombia)",
+  "edge-es-alvaro": "Álvaro (España)",
+  "edge-es-elvira": "Elvira (España)",
+  "edge-mx-dalia": "Dalia (México)",
+  "edge-mx-jorge": "Jorge (México)",
+  "edge-ar-elena": "Elena (Argentina)",
+  "edge-ar-tomas": "Tomás (Argentina)",
+  "edge-cl-catalina": "Catalina (Chile)",
+  "edge-cl-lorenzo": "Lorenzo (Chile)",
+  "edge-pe-camila": "Camila (Perú)",
+  "edge-pe-alex": "Alex (Perú)",
+  "edge-ve-paola": "Paola (Venezuela)",
+  "edge-ve-sebastian": "Sebastián (Venezuela)",
+  "edge-us-paloma": "Paloma (EE. UU.)",
+  "edge-us-alonso": "Alonso (EE. UU.)"
 }
